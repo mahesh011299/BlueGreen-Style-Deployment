@@ -8,11 +8,11 @@ pipeline {
     }
 
     environment {
+        PATH      = "C:\\Program Files\\Docker\\Docker\\resources\\bin;${env.PATH}"
         APP_IMAGE = 'orders-api'
         NETWORK   = 'orders-network'
         DB_HOST   = 'orders-db'
     }
-
     stages {
         stage('Validation') {
             steps {
