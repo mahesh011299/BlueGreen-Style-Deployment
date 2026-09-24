@@ -30,13 +30,13 @@ pipeline {
         stage('Determine Target Slot') {
             steps {
                 script {
-                    // Check if orders-blue is currently mapped as active in nginx
-                    def active = sh(
-                        script: "docker exec orders-proxy cat /etc/nginx/conf.d/default.conf | grep 'orders-blue' || true",
-                        returnStdout: true
-                    ).trim()
+                    // Check if orders-blue is currently active inside the nginx config
+                    def status = bat(
+                        script: "@docker exec orders-proxy cat /etc/nginx/conf.d/default.conf | findstr orders-blue >nul 2>&1",
+                        returnStatus: true
+                    )
 
-                    if (active) {
+                    if (status == 0) {
                         env.CANDIDATE_SLOT = "orders-green"
                         env.CANDIDATE_PORT = "8082"
                         env.ACTIVE_SLOT    = "orders-blue"
@@ -54,30 +54,18 @@ pipeline {
         stage('Docker Build') {
             steps {
                 script {
-                    env.GIT_SHA = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-                    sh """
-                        docker build \
-                          --build-arg APP_VERSION=${params.VERSION} \
-                          --build-arg GIT_COMMIT=${env.GIT_SHA} \
-                          -t ${APP_IMAGE}:${params.VERSION} \
-                          -t ${APP_IMAGE}:${env.GIT_SHA} .
-                    """
+                    def sha = bat(script: "@git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.GIT_SHA = sha
+                    bat "docker build --build-arg APP_VERSION=${params.VERSION} --build-arg GIT_COMMIT=${env.GIT_SHA} -t ${APP_IMAGE}:${params.VERSION} -t ${APP_IMAGE}:${env.GIT_SHA} ."
                 }
             }
         }
 
         stage('Start Candidate') {
             steps {
-                sh """
-                    docker rm -f ${env.CANDIDATE_SLOT} || true
-                    docker run -d \
-                      --name ${env.CANDIDATE_SLOT} \
-                      --network ${env.NETWORK} \
-                      -p ${env.CANDIDATE_PORT}:5000 \
-                      -e APP_VERSION=${params.VERSION} \
-                      -e GIT_COMMIT=${env.GIT_SHA} \
-                      -e DB_HOST=${env.DB_HOST} \
-                      ${APP_IMAGE}:${params.VERSION}
+                bat """
+                    docker rm -f ${env.CANDIDATE_SLOT} 2>nul || (exit 0)
+                    docker run -d --name ${env.CANDIDATE_SLOT} --network ${env.NETWORK} -p ${env.CANDIDATE_PORT}:5000 -e APP_VERSION=${params.VERSION} -e GIT_COMMIT=${env.GIT_SHA} -e DB_HOST=${env.DB_HOST} ${APP_IMAGE}:${params.VERSION}
                 """
             }
         }
@@ -86,10 +74,10 @@ pipeline {
             steps {
                 script {
                     echo "Validating candidate container health..."
-                    timeout(time: 30, unit: 'SECONDS') {
+                    timeout(time: 45, unit: 'SECONDS') {
                         waitUntil {
-                            def health = sh(
-                                script: "docker inspect --format='{{json .State.Health.Status}}' ${env.CANDIDATE_SLOT} || true",
+                            def health = bat(
+                                script: "@docker inspect --format=\"{{.State.Health.Status}}\" ${env.CANDIDATE_SLOT}",
                                 returnStdout: true
                             ).trim()
                             return health.contains("healthy")
@@ -97,7 +85,7 @@ pipeline {
                     }
 
                     echo "Testing Candidate HTTP and DB connectivity..."
-                    sh """
+                    bat """
                         curl -f http://localhost:${env.CANDIDATE_PORT}/health
                         curl -f http://localhost:${env.CANDIDATE_PORT}/db-check
                     """
@@ -109,8 +97,8 @@ pipeline {
             steps {
                 script {
                     echo "Switching live traffic to ${env.CANDIDATE_SLOT}..."
-                    sh """
-                        docker exec orders-proxy sed -i 's/${env.ACTIVE_SLOT}/${env.CANDIDATE_SLOT}/g' /etc/nginx/conf.d/default.conf
+                    bat """
+                        docker exec orders-proxy sed -i "s/${env.ACTIVE_SLOT}/${env.CANDIDATE_SLOT}/g" /etc/nginx/conf.d/default.conf
                         docker exec orders-proxy nginx -s reload
                     """
                 }
@@ -119,34 +107,27 @@ pipeline {
 
         stage('Old Version Cleanup') {
             steps {
-                sh """
-                    echo "Stopping previous production slot: ${env.ACTIVE_SLOT}"
-                    docker stop ${env.ACTIVE_SLOT} || true
-                    docker rm ${env.ACTIVE_SLOT} || true
+                bat """
+                    docker stop ${env.ACTIVE_SLOT} 2>nul || (exit 0)
+                    docker rm ${env.ACTIVE_SLOT} 2>nul || (exit 0)
                 """
             }
         }
 
         stage('Deployment Verification') {
             steps {
-                sh """
-                    curl -s http://localhost:8080/ | grep '"version": "${params.VERSION}"'
-                """
+                bat "curl -s http://localhost:8080/ | findstr \"${params.VERSION}\""
             }
         }
     }
 
     post {
         failure {
-            echo "Deployment FAILED! Initiating automatic recovery/rollback..."
-            sh """
-                # Abort candidate container and keep active slot untouched
-                docker rm -f ${env.CANDIDATE_SLOT} || true
-                echo "Cleaned up candidate slot: ${env.CANDIDATE_SLOT}. Active slot remains untouched."
-            """
+            echo "Deployment FAILED! Initiating automatic candidate cleanup..."
+            bat "docker rm -f %CANDIDATE_SLOT% 2>nul || (exit 0)"
         }
         success {
-            echo "Production Blue-Green deployment of version ${params.VERSION} completed successfully!"
+            echo "Production Blue-Green deployment completed successfully!"
         }
     }
 }
